@@ -88,10 +88,18 @@
     function connect() {
       const proto = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${proto}://${location.host}/ws/client?id=${encodeURIComponent(clientId)}`);
-      ws.onopen = () => { retry = 0; lastSent = null; statusEl.textContent = "Live"; statusEl.classList.add("online"); };
+      ws.onopen = () => {
+        retry = 0; lastSent = null;
+        statusEl.textContent = "Live"; statusEl.classList.add("online");
+        flush(); // deliver anything picked while we were reconnecting
+      };
       ws.onmessage = (e) => {
         const msg = JSON.parse(e.data);
-        if (msg.type === "welcome") labelEl.textContent = msg.label;
+        if (msg.type !== "welcome") return;
+        labelEl.textContent = msg.label;
+        // The server hands out a fresh id when this one is already in use (e.g. a duplicated tab).
+        if (msg.id !== clientId) { clientId = msg.id; sessionStorage.setItem("clientId", clientId); }
+        if (msg.color && pending === null) showColor(msg.color);
       };
       ws.onclose = () => {
         statusEl.textContent = "Reconnecting…"; statusEl.classList.remove("online");
@@ -127,14 +135,29 @@
       thumb.style.display = "block";
       thumb.style.left = x + "px";
       thumb.style.top = y + "px";
+      showColor(color);
+      queueSend(color);
+    }
+    function showColor(color) {
       thumb.style.background = color;
       document.body.style.backgroundColor = color;
       document.body.classList.toggle("light", isLight(color));
       hexEl.textContent = color.toUpperCase();
-      queueSend(color);
     }
-    pad.addEventListener("pointerdown", (e) => { pad.setPointerCapture(e.pointerId); lastSent = null; pick(e); });
-    pad.addEventListener("pointermove", (e) => { if (pad.hasPointerCapture(e.pointerId)) pick(e); });
+    // Follow only the first finger on the pad; extra fingers are ignored until it lifts.
+    let activePointer = null;
+    pad.addEventListener("pointerdown", (e) => {
+      if (activePointer !== null) return;
+      activePointer = e.pointerId;
+      pad.setPointerCapture(e.pointerId);
+      lastSent = null; // re-send even an unchanged color so an idle client rejoins
+      pick(e);
+    });
+    pad.addEventListener("pointermove", (e) => { if (e.pointerId === activePointer) pick(e); });
+    const release = (e) => { if (e.pointerId === activePointer) activePointer = null; };
+    pad.addEventListener("pointerup", release);
+    pad.addEventListener("pointercancel", release);
+    pad.addEventListener("lostpointercapture", release);
     document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
   </script>
 </body>

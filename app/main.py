@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
+import secrets
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -13,6 +15,8 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+log = logging.getLogger("live_color_picker")
 
 STATIC_DIR = Path(__file__).parent / "static"
 IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT", "4"))
@@ -36,6 +40,29 @@ class Client:
         return {"id": self.id, "label": self.label, "color": self.color}
 
 
+class Outbox:
+    """Pending messages for one master socket, coalesced per client.
+
+    Only the newest message per client is kept, so a slow master receives the
+    latest state instead of an ever-growing backlog of intermediate colors.
+    """
+
+    def __init__(self) -> None:
+        self.pending: dict[str, dict] = {}
+        self.ready = asyncio.Event()
+
+    def put(self, key: str, message: dict) -> None:
+        self.pending.pop(key, None)  # re-insert so delivery order follows the latest change
+        self.pending[key] = message
+        self.ready.set()
+
+    async def drain(self) -> list[dict]:
+        await self.ready.wait()
+        self.ready.clear()
+        messages, self.pending = list(self.pending.values()), {}
+        return messages
+
+
 @dataclass
 class Hub:
     """In-memory state shared by all sockets (single-process deployment)."""
@@ -44,8 +71,7 @@ class Hub:
     clients: dict[str, Client] = field(default_factory=dict)
     # Active client ids in the order they (re)joined the master display.
     active_order: list[str] = field(default_factory=list)
-    # One outgoing queue per master socket, so a slow master never blocks clients.
-    masters: set[asyncio.Queue] = field(default_factory=set)
+    masters: set[Outbox] = field(default_factory=set)
     _next_label: int = 1
 
     def get_or_create(self, client_id: str) -> Client:
@@ -59,7 +85,7 @@ class Hub:
     def snapshot(self) -> list[dict]:
         return [self.clients[cid].public() for cid in self.active_order]
 
-    async def set_color(self, client: Client, color: str, now: float | None = None) -> None:
+    def set_color(self, client: Client, color: str, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         if client.first_color is None:
             client.first_color = color
@@ -69,31 +95,31 @@ class Hub:
         if not client.active:
             client.active = True
             self.active_order.append(client.id)
-        await self.broadcast({"type": "color", **client.public()})
+        self.broadcast(client.id, {"type": "color", **client.public()})
 
-    async def deactivate(self, client: Client) -> None:
+    def deactivate(self, client: Client) -> None:
         if not client.active:
             return
         client.active = False
         self.active_order.remove(client.id)
-        await self.broadcast({"type": "leave", "id": client.id})
+        self.broadcast(client.id, {"type": "leave", "id": client.id})
 
-    async def sweep(self, now: float | None = None) -> None:
+    def sweep(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         for cid in list(self.active_order):
             client = self.clients[cid]
             if now - client.updated_at >= self.idle_timeout:
-                await self.deactivate(client)
+                self.deactivate(client)
 
-    async def broadcast(self, message: dict) -> None:
-        for queue in self.masters:
-            queue.put_nowait(message)
+    def broadcast(self, key: str, message: dict) -> None:
+        for outbox in self.masters:
+            outbox.put(key, message)
 
-    def add_master(self) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
-        queue.put_nowait({"type": "snapshot", "clients": self.snapshot(), "idle_timeout": self.idle_timeout})
-        self.masters.add(queue)
-        return queue
+    def add_master(self) -> Outbox:
+        outbox = Outbox()
+        outbox.put("", {"type": "snapshot", "clients": self.snapshot(), "idle_timeout": self.idle_timeout})
+        self.masters.add(outbox)
+        return outbox
 
 
 hub = Hub()
@@ -102,7 +128,10 @@ hub = Hub()
 async def _sweeper() -> None:
     while True:
         await asyncio.sleep(SWEEP_INTERVAL)
-        await hub.sweep()
+        try:
+            hub.sweep()
+        except Exception:
+            log.exception("idle sweep failed")
 
 
 @asynccontextmanager
@@ -150,40 +179,49 @@ async def client_socket(ws: WebSocket, id: str = "") -> None:
         await ws.close(code=1008)
         return
     await ws.accept()
+    existing = hub.clients.get(id)
+    if existing is not None and existing.connections > 0:
+        # Same id already connected (e.g. a duplicated browser tab): give this one its own slot.
+        id = secrets.token_urlsafe(12)
     client = hub.get_or_create(id)
     client.connections += 1
-    await ws.send_json({"type": "welcome", "id": client.id, "label": client.label, "color": client.color})
     try:
+        await ws.send_json({"type": "welcome", "id": client.id, "label": client.label, "color": client.color})
         while True:
             msg = await ws.receive_json()
             color = msg.get("color") if isinstance(msg, dict) else None
             if isinstance(color, str) and COLOR_RE.match(color):
-                await hub.set_color(client, color.lower())
-    except (WebSocketDisconnect, ValueError):
+                hub.set_color(client, color.lower())
+    except (WebSocketDisconnect, ValueError, KeyError):
         pass
     finally:
         client.connections -= 1
         if client.connections == 0:
-            await hub.deactivate(client)
+            hub.deactivate(client)
 
 
 @app.websocket("/ws/master")
 async def master_socket(ws: WebSocket) -> None:
     await ws.accept()
-    queue = hub.add_master()
+    outbox = hub.add_master()
 
-    async def pump() -> None:
+    async def send_loop() -> None:
         while True:
-            await ws.send_json(await queue.get())
+            for message in await outbox.drain():
+                await ws.send_json(message)
 
-    sender = asyncio.create_task(pump())
-    try:
+    async def receive_loop() -> None:
         while True:
             await ws.receive_text()  # masters only listen; this detects disconnects
-    except WebSocketDisconnect:
-        pass
+
+    tasks = [asyncio.create_task(send_loop()), asyncio.create_task(receive_loop())]
+    try:
+        # Whichever side fails first (send error or disconnect) ends the session.
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        hub.masters.discard(queue)
-        sender.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await sender
+        hub.masters.discard(outbox)
+        for task in tasks:
+            task.cancel()
+        for task in tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await task

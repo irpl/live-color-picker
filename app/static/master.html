@@ -82,7 +82,7 @@
     }
 
     // Pick the row count whose tiles are closest to square, then spread
-    // tiles across rows so every row fills the full width evenly.
+    // tiles across rows so every row fills the full width and every tile has equal area.
     function layout() {
       const n = tiles.size;
       empty.style.display = n ? "none" : "grid";
@@ -100,6 +100,7 @@
         const count = Math.floor(n / rows) + (r < n % rows ? 1 : 0);
         const row = document.createElement("div");
         row.className = "row";
+        row.style.flexGrow = count; // row height ∝ tile count, so every tile gets an equal share of the screen
         for (let c = 0; c < count; c++) row.appendChild(els[i++]);
         rowEls.push(row);
       }

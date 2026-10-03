@@ -48,23 +48,58 @@ def test_color_flows_to_master_and_is_recorded(client):
 
 def test_idle_clients_are_removed_and_rejoin():
     hub = main.Hub(idle_timeout=4)
-    events = asyncio.Queue()
-    hub.masters.add(events)
     c = hub.get_or_create("x")
 
     async def scenario():
-        await hub.set_color(c, "#123456", now=100)
-        await hub.sweep(now=103)
+        outbox = hub.add_master()
+        types = lambda msgs: [m["type"] for m in msgs]
+        assert types(await outbox.drain()) == ["snapshot"]
+        hub.set_color(c, "#123456", now=100)
+        hub.sweep(now=103)
         assert hub.active_order == ["x"]
-        await hub.sweep(now=104.1)
+        assert types(await outbox.drain()) == ["color"]
+        hub.sweep(now=104.1)
         assert hub.active_order == []
-        await hub.set_color(c, "#654321", now=110)
+        assert types(await outbox.drain()) == ["leave"]
+        hub.set_color(c, "#654321", now=110)
         assert hub.active_order == ["x"]
         assert c.first_color == "#123456"
+        assert types(await outbox.drain()) == ["color"]
 
     asyncio.run(scenario())
-    types = [events.get_nowait()["type"] for _ in range(events.qsize())]
-    assert types == ["color", "leave", "color"]
+
+
+def test_slow_master_only_gets_latest_color_per_client():
+    hub = main.Hub()
+    a, b = hub.get_or_create("a"), hub.get_or_create("b")
+
+    async def scenario():
+        outbox = hub.add_master()
+        for i in range(100):
+            hub.set_color(a, f"#0000{i:02x}")
+        hub.set_color(b, "#ffffff")
+        hub.set_color(a, "#abcdef")
+        msgs = await outbox.drain()
+        assert [(m["type"], m.get("id")) for m in msgs] == [("snapshot", None), ("color", "b"), ("color", "a")]
+        assert msgs[-1]["color"] == "#abcdef"
+
+    asyncio.run(scenario())
+
+
+def test_duplicate_id_gets_its_own_slot(client):
+    with client.websocket_connect("/ws/client?id=dup") as first, client.websocket_connect("/ws/client?id=dup") as second:
+        w1, w2 = first.receive_json(), second.receive_json()
+        assert w1["id"] == "dup"
+        assert w2["id"] != "dup" and w2["label"] != w1["label"]
+
+
+def test_master_disconnect_is_cleaned_up(client):
+    with client.websocket_connect("/ws/master") as master:
+        master.receive_json()
+        assert len(main.hub.masters) == 1
+    with client.websocket_connect("/ws/client?id=z") as c:  # forces a round trip after the master left
+        c.receive_json()
+    assert len(main.hub.masters) == 0
 
 
 def test_rejects_bad_client_id(client):
