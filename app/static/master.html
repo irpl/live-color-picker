@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Color Master</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden;
+      background: #111114; color: #f4f4f5;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    #stage { position: fixed; inset: 0; display: flex; flex-direction: column; }
+    .row { flex: 1; display: flex; min-height: 0; }
+    .tile {
+      flex: 1; min-width: 0; position: relative;
+      transition: background-color 90ms linear;
+      animation: enter 250ms ease-out;
+    }
+    @keyframes enter { from { opacity: 0; } to { opacity: 1; } }
+    .tag {
+      position: absolute; left: 12px; bottom: 12px;
+      padding: 4px 10px; border-radius: 999px;
+      background: rgba(0,0,0,.35); color: #fff;
+      font-size: 13px; font-variant-numeric: tabular-nums;
+      -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+    }
+    #empty {
+      position: fixed; inset: 0; display: grid; place-content: center; gap: 12px;
+      text-align: center; color: #a1a1aa; padding: 16px;
+    }
+    #empty h1 { margin: 0; font-size: clamp(22px, 4vw, 40px); color: #f4f4f5; font-weight: 600; }
+    #empty code { color: #f4f4f5; font-size: 16px; word-break: break-all; }
+    #status {
+      position: fixed; top: 12px; right: 12px; z-index: 1;
+      padding: 4px 10px; border-radius: 999px; font-size: 12px;
+      background: rgba(0,0,0,.45); color: #fff; display: none;
+    }
+    #status.show { display: block; }
+  </style>
+</head>
+<body>
+  <div id="stage"></div>
+  <div id="empty">
+    <h1>Waiting for colors…</h1>
+    <div>Open <code id="url"></code> on a phone to start picking.</div>
+  </div>
+  <div id="status">Reconnecting…</div>
+
+  <script>
+    const stage = document.getElementById("stage");
+    const empty = document.getElementById("empty");
+    const statusEl = document.getElementById("status");
+    document.getElementById("url").textContent = location.origin + "/";
+
+    // id -> { el, tag }. Map insertion order = display order.
+    const tiles = new Map();
+
+    function makeTile(id, label) {
+      const el = document.createElement("div");
+      el.className = "tile";
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = label;
+      el.appendChild(tag);
+      tiles.set(id, { el, tag });
+      return tiles.get(id);
+    }
+
+    // Returns true when a new tile was created (so the layout needs updating).
+    function setColor({ id, label, color }) {
+      const isNew = !tiles.has(id);
+      const t = isNew ? makeTile(id, label) : tiles.get(id);
+      t.el.style.backgroundColor = color;
+      t.tag.textContent = `${label} · ${color.toUpperCase()}`;
+      return isNew;
+    }
+
+    function remove(id) {
+      if (tiles.delete(id)) layout();
+    }
+
+    // Pick the row count whose tiles are closest to square, then spread
+    // tiles across rows so every row fills the full width evenly.
+    function layout() {
+      const n = tiles.size;
+      empty.style.display = n ? "none" : "grid";
+      const W = window.innerWidth, H = window.innerHeight;
+      let rows = 1, best = Infinity;
+      for (let r = 1; r <= Math.max(1, n); r++) {
+        const cols = Math.ceil(n / r);
+        const score = Math.abs(Math.log((W / cols) / (H / r)));
+        if (score < best) { best = score; rows = r; }
+      }
+      const els = [...tiles.values()].map((t) => t.el);
+      const rowEls = [];
+      let i = 0;
+      for (let r = 0; r < rows && i < n; r++) {
+        const count = Math.floor(n / rows) + (r < n % rows ? 1 : 0);
+        const row = document.createElement("div");
+        row.className = "row";
+        for (let c = 0; c < count; c++) row.appendChild(els[i++]);
+        rowEls.push(row);
+      }
+      stage.replaceChildren(...rowEls);
+    }
+    window.addEventListener("resize", layout);
+
+    let retry = 0;
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws/master`);
+      ws.onopen = () => { retry = 0; statusEl.classList.remove("show"); };
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "snapshot") {
+          tiles.clear();
+          msg.clients.forEach(setColor);
+          layout();
+        } else if (msg.type === "color") {
+          if (setColor(msg)) layout();
+        } else if (msg.type === "leave") {
+          remove(msg.id);
+        }
+      };
+      ws.onclose = () => {
+        statusEl.classList.add("show");
+        setTimeout(connect, Math.min(5000, 250 * 2 ** retry++));
+      };
+    }
+    connect();
+    layout();
+  </script>
+</body>
+</html>

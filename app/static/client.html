@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#1b1b1f">
+  <title>Pick a Color</title>
+  <style>
+    :root { --bg: #1b1b1f; --fg: #f4f4f5; --muted: #a1a1aa; }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden;
+      background: var(--bg); color: var(--fg);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      -webkit-user-select: none; user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      overscroll-behavior: none;
+    }
+    body {
+      display: flex; flex-direction: column; gap: 16px;
+      height: 100dvh;
+      padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+      transition: background-color 120ms linear;
+    }
+    header { display: flex; justify-content: space-between; align-items: center; font-size: 15px; }
+    #status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+    #status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: #ef4444; }
+    #status.online::before { background: #22c55e; }
+    body.light { --fg: #18181b; --muted: #3f3f46; }
+    #pad {
+      position: relative; flex: 1; min-height: 0;
+      border-radius: 20px; touch-action: none; cursor: crosshair;
+      box-shadow: 0 0 0 1px rgba(255,255,255,.15), 0 8px 30px rgba(0,0,0,.35);
+      /* HSL with full saturation: hue across, lightness 100% (top) to 0% (bottom). */
+      background:
+        linear-gradient(to bottom, #fff, rgba(255,255,255,0) 50%, rgba(0,0,0,0) 50%, #000),
+        linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);
+    }
+    #thumb {
+      position: absolute; width: 44px; height: 44px; margin: -22px 0 0 -22px;
+      border-radius: 50%; border: 4px solid #fff; pointer-events: none;
+      box-shadow: 0 0 0 1px rgba(0,0,0,.4), 0 4px 12px rgba(0,0,0,.4);
+      left: 50%; top: 50%; display: none;
+    }
+    #hint { text-align: center; color: var(--muted); font-size: 14px; }
+    #hex { font-variant-numeric: tabular-nums; font-weight: 600; letter-spacing: .04em; }
+  </style>
+</head>
+<body>
+  <header>
+    <span id="label">Pick a color</span>
+    <span id="status">Connecting…</span>
+  </header>
+  <div id="pad" role="slider" aria-label="Color picker"><div id="thumb"></div></div>
+  <div id="hint">Touch and drag to choose a color <span id="hex"></span></div>
+
+  <script>
+    const pad = document.getElementById("pad");
+    const thumb = document.getElementById("thumb");
+    const statusEl = document.getElementById("status");
+    const labelEl = document.getElementById("label");
+    const hexEl = document.getElementById("hex");
+
+    // One id per browser tab, kept across reloads/reconnects so the master keeps the same slot.
+    let clientId = sessionStorage.getItem("clientId");
+    if (!clientId) {
+      clientId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)).replace(/[^A-Za-z0-9_-]/g, "");
+      sessionStorage.setItem("clientId", clientId);
+    }
+
+    function hslToHex(h, s, l) {
+      const a = s * Math.min(l, 1 - l);
+      const f = (n) => {
+        const k = (n + h / 30) % 12;
+        const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+        return Math.round(c * 255).toString(16).padStart(2, "0");
+      };
+      return "#" + f(0) + f(8) + f(4);
+    }
+
+    function isLight(hex) {
+      const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+      return 0.299 * r + 0.587 * g + 0.114 * b > 150;
+    }
+
+    // --- socket with auto-reconnect ---------------------------------------
+    let ws = null, retry = 0;
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/ws/client?id=${encodeURIComponent(clientId)}`);
+      ws.onopen = () => { retry = 0; lastSent = null; statusEl.textContent = "Live"; statusEl.classList.add("online"); };
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "welcome") labelEl.textContent = msg.label;
+      };
+      ws.onclose = () => {
+        statusEl.textContent = "Reconnecting…"; statusEl.classList.remove("online");
+        setTimeout(connect, Math.min(5000, 250 * 2 ** retry++));
+      };
+    }
+    connect();
+
+    // --- throttled sending (≈30 updates/s, always delivers the last value) --
+    const SEND_INTERVAL = 33;
+    let pending = null, lastSent = null, lastSentAt = 0, timer = null;
+    function queueSend(color) {
+      pending = color;
+      const wait = SEND_INTERVAL - (performance.now() - lastSentAt);
+      if (wait <= 0) flush();
+      else if (!timer) timer = setTimeout(flush, wait);
+    }
+    function flush() {
+      timer = null;
+      if (pending === null || pending === lastSent || !ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ color: pending }));
+      lastSent = pending; lastSentAt = performance.now();
+    }
+
+    // --- picker -----------------------------------------------------------
+    function pick(e) {
+      const r = pad.getBoundingClientRect();
+      const x = Math.min(Math.max(e.clientX - r.left, 0), r.width);
+      const y = Math.min(Math.max(e.clientY - r.top, 0), r.height);
+      const hue = (x / r.width) * 360;
+      const light = 1 - y / r.height;
+      const color = hslToHex(hue % 360, 1, light);
+      thumb.style.display = "block";
+      thumb.style.left = x + "px";
+      thumb.style.top = y + "px";
+      thumb.style.background = color;
+      document.body.style.backgroundColor = color;
+      document.body.classList.toggle("light", isLight(color));
+      hexEl.textContent = color.toUpperCase();
+      queueSend(color);
+    }
+    pad.addEventListener("pointerdown", (e) => { pad.setPointerCapture(e.pointerId); lastSent = null; pick(e); });
+    pad.addEventListener("pointermove", (e) => { if (pad.hasPointerCapture(e.pointerId)) pick(e); });
+    document.addEventListener("touchmove", (e) => e.preventDefault(), { passive: false });
+  </script>
+</body>
+</html>
