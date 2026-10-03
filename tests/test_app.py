@@ -16,34 +16,42 @@ def client(monkeypatch):
 
 def test_pages_served(client):
     assert "pad" in client.get("/").text
-    assert "stage" in client.get("/master").text
+    assert "stage" in client.get("/display").text
 
 
-def test_color_flows_to_master_and_is_recorded(client):
-    with client.websocket_connect("/ws/master") as master:
-        assert master.receive_json() == {"type": "snapshot", "clients": [], "idle_timeout": 4}
+def test_qr_code_points_at_public_url(client, monkeypatch):
+    r = client.get("/qr.svg")
+    assert r.headers["content-type"] == "image/svg+xml"
+    assert r.text.startswith("<svg") and "viewBox" in r.text
+    monkeypatch.setattr(main, "PUBLIC_URL", "https://color.example.com")
+    assert client.get("/join-url").json() == {"url": "https://color.example.com/"}
+
+
+def test_color_flows_to_display_and_is_recorded(client):
+    with client.websocket_connect("/ws/display") as display:
+        assert display.receive_json() == {"type": "snapshot", "clients": [], "idle_timeout": 4}
         with client.websocket_connect("/ws/client?id=alice&session=s1") as a, client.websocket_connect("/ws/client?id=bob&session=s1") as b:
             assert a.receive_json()["label"] == "Player 1"
             assert b.receive_json()["label"] == "Player 2"
             a.send_json({"color": "#FF0000"})
-            assert master.receive_json() == {"type": "color", "id": "alice", "label": "Player 1", "color": "#ff0000"}
+            assert display.receive_json() == {"type": "color", "id": "alice", "label": "Player 1", "color": "#ff0000"}
             b.send_json({"color": "#00ff00"})
-            assert master.receive_json()["id"] == "bob"
+            assert display.receive_json()["id"] == "bob"
             a.send_json({"color": "not-a-color"})  # ignored
             a.send_json({"color": "#0000ff"})
-            assert master.receive_json()["color"] == "#0000ff"
+            assert display.receive_json()["color"] == "#0000ff"
 
             recorded = {c["id"]: c for c in client.get("/api/clients").json()}
             assert recorded["alice"]["first_color"] == "#ff0000"
             assert recorded["alice"]["color"] == "#0000ff"
             assert recorded["bob"]["active"] is True
 
-            # A master joining late sees both active clients in join order.
-            with client.websocket_connect("/ws/master") as late:
+            # A display joining late sees both active clients in join order.
+            with client.websocket_connect("/ws/display") as late:
                 snap = late.receive_json()
                 assert [c["id"] for c in snap["clients"]] == ["alice", "bob"]
-        # Disconnecting clients are removed from the master view.
-        leaves = {master.receive_json()["id"], master.receive_json()["id"]}
+        # Disconnecting clients are removed from the display view.
+        leaves = {display.receive_json()["id"], display.receive_json()["id"]}
         assert leaves == {"alice", "bob"}
 
 
@@ -52,7 +60,7 @@ def test_idle_clients_are_removed_and_rejoin():
     c = hub.get_or_create("x")
 
     async def scenario():
-        outbox = hub.add_master()
+        outbox = hub.add_display()
         types = lambda msgs: [m["type"] for m in msgs]
         assert types(await outbox.drain()) == ["snapshot"]
         hub.set_color(c, "#123456", now=100)
@@ -70,12 +78,12 @@ def test_idle_clients_are_removed_and_rejoin():
     asyncio.run(scenario())
 
 
-def test_slow_master_only_gets_latest_color_per_client():
+def test_slow_display_only_gets_latest_color_per_client():
     hub = main.Hub()
     a, b = hub.get_or_create("a"), hub.get_or_create("b")
 
     async def scenario():
-        outbox = hub.add_master()
+        outbox = hub.add_display()
         for i in range(100):
             hub.set_color(a, f"#0000{i:02x}")
         hub.set_color(b, "#ffffff")
@@ -98,12 +106,12 @@ def test_duplicate_tab_gets_its_own_slot(client):
 def test_reconnect_from_same_page_takes_over_slot(client):
     from starlette.websockets import WebSocketDisconnect
 
-    with client.websocket_connect("/ws/master") as master:
-        master.receive_json()
+    with client.websocket_connect("/ws/display") as display:
+        display.receive_json()
         with client.websocket_connect("/ws/client?id=p&session=page1") as old:
             assert old.receive_json()["label"] == "Player 1"
             old.send_json({"color": "#111111"})
-            assert master.receive_json()["type"] == "color"
+            assert display.receive_json()["type"] == "color"
             # Old socket not yet noticed as dead; the same page reconnects and takes over.
             with client.websocket_connect("/ws/client?id=p&session=page1") as new:
                 welcome = new.receive_json()
@@ -113,9 +121,9 @@ def test_reconnect_from_same_page_takes_over_slot(client):
                 assert closed.value.code == 4000
                 new.send_json({"color": "#222222"})
                 # The replaced socket closing must not remove the tile.
-                assert master.receive_json() == {"type": "color", "id": "p", "label": "Player 1", "color": "#222222"}
+                assert display.receive_json() == {"type": "color", "id": "p", "label": "Player 1", "color": "#222222"}
                 assert main.hub.active_order == ["p"]
-            assert master.receive_json() == {"type": "leave", "id": "p"}
+            assert display.receive_json() == {"type": "leave", "id": "p"}
 
 
 def test_rejects_invalid_colors_and_ids(client):
@@ -139,13 +147,13 @@ def test_rejects_invalid_colors_and_ids(client):
     assert [c["color"] for c in client.get("/api/clients").json()] == ["#00ff00"]
 
 
-def test_master_disconnect_is_cleaned_up(client):
-    with client.websocket_connect("/ws/master") as master:
-        master.receive_json()
-        assert len(main.hub.masters) == 1
-    with client.websocket_connect("/ws/client?id=z&session=s1") as c:  # forces a round trip after the master left
+def test_display_disconnect_is_cleaned_up(client):
+    with client.websocket_connect("/ws/display") as display:
+        display.receive_json()
+        assert len(main.hub.displays) == 1
+    with client.websocket_connect("/ws/client?id=z&session=s1") as c:  # forces a round trip after the display left
         c.receive_json()
-    assert len(main.hub.masters) == 0
+    assert len(main.hub.displays) == 0
 
 
 def test_rejects_bad_client_id(client):
@@ -171,14 +179,14 @@ def test_label_survives_server_restart(client, monkeypatch):
         assert d.receive_json()["label"] == "Player 4"  # hint already taken
 
 
-def test_master_ignores_binary_frames(client):
-    with client.websocket_connect("/ws/master") as master:
-        master.receive_json()
-        master.send_bytes(b"\x01\x02")
+def test_display_ignores_binary_frames(client):
+    with client.websocket_connect("/ws/display") as display:
+        display.receive_json()
+        display.send_bytes(b"\x01\x02")
         with client.websocket_connect("/ws/client?id=m&session=s1") as c:
             assert c.receive_json()["idle_timeout"] == 4
             c.send_json({"color": "#010203"})
-            assert master.receive_json()["color"] == "#010203"
+            assert display.receive_json()["color"] == "#010203"
 
 
 def test_takeover_does_not_wait_for_old_socket_close(client, monkeypatch):

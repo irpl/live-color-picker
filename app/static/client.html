@@ -61,7 +61,7 @@
     const labelEl = document.getElementById("label");
     const hexEl = document.getElementById("hex");
 
-    // One id per browser tab, kept across reloads/reconnects so the master keeps the same slot.
+    // One id per browser tab, kept across reloads/reconnects so the display keeps the same slot.
     let clientId = sessionStorage.getItem("clientId");
     let label = sessionStorage.getItem("label") || "";
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(clientId || "")) {
@@ -123,7 +123,7 @@
         if (msg.id !== clientId) { clientId = msg.id; sessionStorage.setItem("clientId", clientId); }
         if (msg.color && pending === null) showColor(msg.color);
         // Re-send a color that never got through, or one picked recently enough that this
-        // client should still be on the master (e.g. the server restarted and forgot it).
+        // client should still be on the display (e.g. the server restarted and forgot it).
         if (pending !== null && performance.now() - lastPickAt < msg.idle_timeout * 1000) unsent = true;
         flush();
       };

@@ -1,8 +1,9 @@
-"""Live color picker: clients pick colors, a master screen shows them in real time."""
+"""Live color picker: clients pick colors, a shared display shows them in real time."""
 
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -13,8 +14,9 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+import segno
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 log = logging.getLogger("live_color_picker")
@@ -25,6 +27,9 @@ SWEEP_INTERVAL = 0.25
 COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 CLIENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 LABEL_RE = re.compile(r"Player ([1-9][0-9]{0,5})")
+# Address phones should open. Behind a proxy the request URL can be wrong (http, internal host),
+# so a deployment sets this; otherwise the URL the display was opened on is used.
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "")
 
 
 @dataclass
@@ -45,9 +50,9 @@ class Client:
 
 
 class Outbox:
-    """Pending messages for one master socket, coalesced per client.
+    """Pending messages for one display socket, coalesced per client.
 
-    Only the newest message per client is kept, so a slow master receives the
+    Only the newest message per client is kept, so a slow display receives the
     latest state instead of an ever-growing backlog of intermediate colors.
     """
 
@@ -72,9 +77,9 @@ class Hub:
 
     idle_timeout: float = IDLE_TIMEOUT
     clients: dict[str, Client] = field(default_factory=dict)
-    # Active client ids in the order they (re)joined the master display.
+    # Active client ids in the order they (re)joined the display.
     active_order: list[str] = field(default_factory=list)
-    masters: set[Outbox] = field(default_factory=set)
+    displays: set[Outbox] = field(default_factory=set)
     _next_label: int = 1
 
     def get_or_create(self, client_id: str, label_hint: str = "") -> Client:
@@ -124,13 +129,13 @@ class Hub:
                 self.deactivate(client)
 
     def broadcast(self, key: str, message: dict) -> None:
-        for outbox in self.masters:
+        for outbox in self.displays:
             outbox.put(key, message)
 
-    def add_master(self) -> Outbox:
+    def add_display(self) -> Outbox:
         outbox = Outbox()
         outbox.put("", {"type": "snapshot", "clients": self.snapshot(), "idle_timeout": self.idle_timeout})
-        self.masters.add(outbox)
+        self.displays.add(outbox)
         return outbox
 
 
@@ -166,9 +171,28 @@ async def client_page() -> FileResponse:
     return FileResponse(STATIC_DIR / "client.html")
 
 
-@app.get("/master", include_in_schema=False)
-async def master_page() -> FileResponse:
-    return FileResponse(STATIC_DIR / "master.html")
+@app.get("/display", include_in_schema=False)
+async def display_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "display.html")
+
+
+@app.get("/join-url", include_in_schema=False)
+async def join_url(request: Request) -> dict:
+    return {"url": _join_url(request)}
+
+
+@app.get("/qr.svg", include_in_schema=False)
+async def join_qr(request: Request) -> Response:
+    """QR code for the phone page, shown on the display so people can join."""
+    buf = io.BytesIO()
+    segno.make(_join_url(request), error="m").save(
+        buf, kind="svg", border=2, dark="#000", light="#fff", xmldecl=False, omitsize=True,
+    )
+    return Response(buf.getvalue(), media_type="image/svg+xml", headers={"Cache-Control": "no-cache"})
+
+
+def _join_url(request: Request) -> str:
+    return PUBLIC_URL.rstrip("/") + "/" if PUBLIC_URL else str(request.base_url)
 
 
 @app.get("/api/clients")
@@ -243,10 +267,10 @@ async def client_socket(ws: WebSocket, id: str = "", session: str = "", label: s
             hub.deactivate(client)
 
 
-@app.websocket("/ws/master")
-async def master_socket(ws: WebSocket) -> None:
+@app.websocket("/ws/display")
+async def display_socket(ws: WebSocket) -> None:
     await ws.accept()
-    outbox = hub.add_master()
+    outbox = hub.add_display()
 
     async def send_loop() -> None:
         while True:
@@ -254,7 +278,7 @@ async def master_socket(ws: WebSocket) -> None:
                 await ws.send_json(message)
 
     async def receive_loop() -> None:
-        while True:  # masters only listen; this detects disconnects
+        while True:  # displays only listen; this detects disconnects
             if (await ws.receive())["type"] == "websocket.disconnect":
                 return
 
@@ -263,9 +287,9 @@ async def master_socket(ws: WebSocket) -> None:
         # Whichever side fails first (send error or disconnect) ends the session.
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
-        hub.masters.discard(outbox)
+        hub.displays.discard(outbox)
         for task in tasks:
             task.cancel()
         for result in await asyncio.gather(*tasks, return_exceptions=True):
             if isinstance(result, Exception) and not isinstance(result, (WebSocketDisconnect, OSError)):
-                log.warning("master socket ended with %r", result)
+                log.warning("display socket ended with %r", result)
