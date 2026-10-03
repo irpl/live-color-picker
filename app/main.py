@@ -24,6 +24,7 @@ IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT", "4"))
 SWEEP_INTERVAL = 0.25
 COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 CLIENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+LABEL_RE = re.compile(r"Player ([1-9][0-9]{0,5})")
 
 
 @dataclass
@@ -76,13 +77,22 @@ class Hub:
     masters: set[Outbox] = field(default_factory=set)
     _next_label: int = 1
 
-    def get_or_create(self, client_id: str) -> Client:
+    def get_or_create(self, client_id: str, label_hint: str = "") -> Client:
         client = self.clients.get(client_id)
         if client is None:
-            client = Client(id=client_id, label=f"Player {self._next_label}")
-            self._next_label += 1
+            client = Client(id=client_id, label=self._new_label(label_hint))
             self.clients[client_id] = client
         return client
+
+    def _new_label(self, hint: str) -> str:
+        # Reuse the label a client had before a server restart, unless someone else has it.
+        match = LABEL_RE.fullmatch(hint)
+        if match and all(c.label != hint for c in self.clients.values()):
+            self._next_label = max(self._next_label, int(match.group(1)) + 1)
+            return hint
+        label = f"Player {self._next_label}"
+        self._next_label += 1
+        return label
 
     def snapshot(self) -> list[dict]:
         return [self.clients[cid].public() for cid in self.active_order]
@@ -175,6 +185,14 @@ async def list_clients() -> list[dict]:
     ]
 
 
+_background: set[asyncio.Task] = set()
+
+
+async def _close_quietly(ws: WebSocket) -> None:
+    with suppress(Exception):
+        await ws.close(code=4000)
+
+
 def _parse_color(text: str | None) -> str | None:
     """Return the color from a client frame, or None for anything malformed (which is ignored)."""
     if not text or len(text) > 256:
@@ -188,7 +206,7 @@ def _parse_color(text: str | None) -> str | None:
 
 
 @app.websocket("/ws/client")
-async def client_socket(ws: WebSocket, id: str = "", session: str = "") -> None:
+async def client_socket(ws: WebSocket, id: str = "", session: str = "", label: str = "") -> None:
     if not (CLIENT_ID_RE.fullmatch(id) and CLIENT_ID_RE.fullmatch(session)):
         await ws.close(code=1008)
         return
@@ -196,15 +214,20 @@ async def client_socket(ws: WebSocket, id: str = "", session: str = "") -> None:
     existing = hub.clients.get(id)
     if existing is not None and existing.socket is not None and existing.session != session:
         # Id is live in another page (e.g. a duplicated browser tab): give this one its own slot.
-        id = secrets.token_urlsafe(12)
-    client = hub.get_or_create(id)
+        id, label = secrets.token_urlsafe(12), ""
+    client = hub.get_or_create(id, label)
     # Same page reconnecting before the server noticed its old socket died: take over the slot.
     previous, client.socket, client.session = client.socket, ws, session
+    if previous is not None:
+        # Close in the background: a half-open old socket must not stall the new one.
+        task = asyncio.create_task(_close_quietly(previous))
+        _background.add(task)
+        task.add_done_callback(_background.discard)
     try:
-        if previous is not None:
-            with suppress(Exception):
-                await previous.close(code=4000)
-        await ws.send_json({"type": "welcome", "id": client.id, "label": client.label, "color": client.color})
+        await ws.send_json({
+            "type": "welcome", "id": client.id, "label": client.label,
+            "color": client.color, "idle_timeout": hub.idle_timeout,
+        })
         while True:
             frame = await ws.receive()
             if frame["type"] == "websocket.disconnect":
@@ -231,8 +254,9 @@ async def master_socket(ws: WebSocket) -> None:
                 await ws.send_json(message)
 
     async def receive_loop() -> None:
-        while True:
-            await ws.receive_text()  # masters only listen; this detects disconnects
+        while True:  # masters only listen; this detects disconnects
+            if (await ws.receive())["type"] == "websocket.disconnect":
+                return
 
     tasks = [asyncio.create_task(send_loop()), asyncio.create_task(receive_loop())]
     try:

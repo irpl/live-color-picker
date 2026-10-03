@@ -63,7 +63,8 @@
 
     // One id per browser tab, kept across reloads/reconnects so the master keeps the same slot.
     let clientId = sessionStorage.getItem("clientId");
-    if (!clientId) {
+    let label = sessionStorage.getItem("label") || "";
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(clientId || "")) {
       clientId = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2)).replace(/[^A-Za-z0-9_-]/g, "");
       sessionStorage.setItem("clientId", clientId);
     }
@@ -86,10 +87,10 @@
     // --- throttled sending (≈30 updates/s, always delivers the last value) --
     const SEND_INTERVAL = 33;
     let ws = null, retry = 0;
-    let pending = null, unsent = false, lastSentAt = 0, timer = null;
+    let pending = null, unsent = false, lastSentAt = 0, lastPickAt = -Infinity, timer = null;
     function queueSend(color, force) {
       if (color === pending && !force) return;
-      pending = color; unsent = true;
+      pending = color; unsent = true; lastPickAt = performance.now();
       const wait = SEND_INTERVAL - (performance.now() - lastSentAt);
       if (wait <= 0) flush();
       else if (!timer) timer = setTimeout(flush, wait);
@@ -107,20 +108,24 @@
     const session = Math.random().toString(36).slice(2, 12) || "s";
     function connect() {
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      const sock = new WebSocket(`${proto}://${location.host}/ws/client?id=${encodeURIComponent(clientId)}&session=${session}`);
+      const sock = new WebSocket(`${proto}://${location.host}/ws/client?id=${encodeURIComponent(clientId)}&session=${session}&label=${encodeURIComponent(label)}`);
       ws = sock;
       sock.onopen = () => {
         retry = 0;
         statusEl.textContent = "Live"; statusEl.classList.add("online");
-        flush(); // deliver a color picked while we were offline, if any
       };
       sock.onmessage = (e) => {
         const msg = JSON.parse(e.data);
         if (msg.type !== "welcome") return;
-        labelEl.textContent = msg.label;
+        label = labelEl.textContent = msg.label;
+        sessionStorage.setItem("label", label);
         // The server hands out a fresh id when this one is in use by another tab.
         if (msg.id !== clientId) { clientId = msg.id; sessionStorage.setItem("clientId", clientId); }
         if (msg.color && pending === null) showColor(msg.color);
+        // Re-send a color that never got through, or one picked recently enough that this
+        // client should still be on the master (e.g. the server restarted and forgot it).
+        if (pending !== null && performance.now() - lastPickAt < msg.idle_timeout * 1000) unsent = true;
+        flush();
       };
       sock.onclose = () => {
         if (sock !== ws) return; // a stale socket we already replaced

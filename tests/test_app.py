@@ -154,3 +154,39 @@ def test_rejects_bad_client_id(client):
     with pytest.raises(WebSocketDisconnect):
         with client.websocket_connect("/ws/client?id=bad id!&session=s1") as ws:
             ws.receive_json()
+
+
+def test_label_survives_server_restart(client, monkeypatch):
+    with client.websocket_connect("/ws/client?id=a&session=s1") as a:
+        assert a.receive_json()["label"] == "Player 1"
+    with client.websocket_connect("/ws/client?id=b&session=s1") as b:
+        assert b.receive_json()["label"] == "Player 2"
+    monkeypatch.setattr(main, "hub", main.Hub())  # restart: all state forgotten
+    # b reconnects first with its old label; a newcomer must not collide with it.
+    with client.websocket_connect("/ws/client?id=b&session=s2&label=Player%202") as b, \
+            client.websocket_connect("/ws/client?id=c&session=s1") as c, \
+            client.websocket_connect("/ws/client?id=d&session=s1&label=Player%202") as d:
+        assert b.receive_json()["label"] == "Player 2"
+        assert c.receive_json()["label"] == "Player 3"
+        assert d.receive_json()["label"] == "Player 4"  # hint already taken
+
+
+def test_master_ignores_binary_frames(client):
+    with client.websocket_connect("/ws/master") as master:
+        master.receive_json()
+        master.send_bytes(b"\x01\x02")
+        with client.websocket_connect("/ws/client?id=m&session=s1") as c:
+            assert c.receive_json()["idle_timeout"] == 4
+            c.send_json({"color": "#010203"})
+            assert master.receive_json()["color"] == "#010203"
+
+
+def test_takeover_does_not_wait_for_old_socket_close(client, monkeypatch):
+    async def never_closes(ws):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(main, "_close_quietly", never_closes)
+    with client.websocket_connect("/ws/client?id=t&session=s1") as old:
+        old.receive_json()
+        with client.websocket_connect("/ws/client?id=t&session=s1") as new:
+            assert new.receive_json()["id"] == "t"
