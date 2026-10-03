@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -21,8 +22,8 @@ log = logging.getLogger("live_color_picker")
 STATIC_DIR = Path(__file__).parent / "static"
 IDLE_TIMEOUT = float(os.environ.get("IDLE_TIMEOUT", "4"))
 SWEEP_INTERVAL = 0.25
-COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+COLOR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+CLIENT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 @dataclass
@@ -34,7 +35,9 @@ class Client:
     color: str | None = None
     updated_at: float = 0.0
     active: bool = False
-    connections: int = 0
+    # The socket currently speaking for this client, and the page-load session it came from.
+    socket: WebSocket | None = None
+    session: str = ""
 
     def public(self) -> dict:
         return {"id": self.id, "label": self.label, "color": self.color}
@@ -52,8 +55,7 @@ class Outbox:
         self.ready = asyncio.Event()
 
     def put(self, key: str, message: dict) -> None:
-        self.pending.pop(key, None)  # re-insert so delivery order follows the latest change
-        self.pending[key] = message
+        self.pending[key] = message  # replaces in place, keeping the order clients first appeared
         self.ready.set()
 
     async def drain(self) -> list[dict]:
@@ -173,30 +175,48 @@ async def list_clients() -> list[dict]:
     ]
 
 
+def _parse_color(text: str | None) -> str | None:
+    """Return the color from a client frame, or None for anything malformed (which is ignored)."""
+    if not text or len(text) > 256:
+        return None
+    try:
+        msg = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    color = msg.get("color") if isinstance(msg, dict) else None
+    return color.lower() if isinstance(color, str) and COLOR_RE.fullmatch(color) else None
+
+
 @app.websocket("/ws/client")
-async def client_socket(ws: WebSocket, id: str = "") -> None:
-    if not CLIENT_ID_RE.match(id):
+async def client_socket(ws: WebSocket, id: str = "", session: str = "") -> None:
+    if not (CLIENT_ID_RE.fullmatch(id) and CLIENT_ID_RE.fullmatch(session)):
         await ws.close(code=1008)
         return
     await ws.accept()
     existing = hub.clients.get(id)
-    if existing is not None and existing.connections > 0:
-        # Same id already connected (e.g. a duplicated browser tab): give this one its own slot.
+    if existing is not None and existing.socket is not None and existing.session != session:
+        # Id is live in another page (e.g. a duplicated browser tab): give this one its own slot.
         id = secrets.token_urlsafe(12)
     client = hub.get_or_create(id)
-    client.connections += 1
+    # Same page reconnecting before the server noticed its old socket died: take over the slot.
+    previous, client.socket, client.session = client.socket, ws, session
     try:
+        if previous is not None:
+            with suppress(Exception):
+                await previous.close(code=4000)
         await ws.send_json({"type": "welcome", "id": client.id, "label": client.label, "color": client.color})
         while True:
-            msg = await ws.receive_json()
-            color = msg.get("color") if isinstance(msg, dict) else None
-            if isinstance(color, str) and COLOR_RE.match(color):
-                hub.set_color(client, color.lower())
-    except (WebSocketDisconnect, ValueError, KeyError):
+            frame = await ws.receive()
+            if frame["type"] == "websocket.disconnect":
+                break
+            color = _parse_color(frame.get("text"))
+            if color is not None:
+                hub.set_color(client, color)
+    except (WebSocketDisconnect, OSError, RuntimeError):
         pass
     finally:
-        client.connections -= 1
-        if client.connections == 0:
+        if client.socket is ws:
+            client.socket = None
             hub.deactivate(client)
 
 
@@ -222,6 +242,6 @@ async def master_socket(ws: WebSocket) -> None:
         hub.masters.discard(outbox)
         for task in tasks:
             task.cancel()
-        for task in tasks:
-            with suppress(asyncio.CancelledError, Exception):
-                await task
+        for result in await asyncio.gather(*tasks, return_exceptions=True):
+            if isinstance(result, Exception) and not isinstance(result, (WebSocketDisconnect, OSError)):
+                log.warning("master socket ended with %r", result)
